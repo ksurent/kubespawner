@@ -14,7 +14,8 @@ def make_pod_spec(
     cpu_limit,
     cpu_guarantee,
     mem_limit,
-    mem_guarantee
+    mem_guarantee,
+    labels={}
 ):
     """
     Make a k8s pod specification for running a user notebook.
@@ -65,6 +66,9 @@ def make_pod_spec(
         String specifying the max amount of RAM the user's pod is guaranteed
         to have access to. String ins loat/int since common suffixes
         are allowed
+      - labels:
+        A dict with labels attached to the pod. Used to let Kubernetes know
+        which pods belong to which services
     """
     pod_security_context = {}
     if run_as_uid is not None:
@@ -79,6 +83,8 @@ def make_pod_spec(
         'kind': 'Pod',
         'metadata': {
             'name': name,
+            # empty is ok and means 'no labels'
+            'labels': labels
         },
         'spec': {
             'securityContext': pod_security_context,
@@ -152,5 +158,31 @@ def make_pvc_spec(
                     'storage': storage
                 }
             }
+        }
+    }
+
+def make_nodeport_spec(name, selector, ports):
+    """
+    Make a k8s pvc specification for running a user notebook.
+
+    Parameters:
+      - name:
+        Service name. Must be unique within the namespace the object is
+        going to be created in. Must be a valid DNS label.
+      - selector:
+        A dictionary with labels used to find pods that will belong to this service
+      - ports:
+        A list of k8s' v1.ServicePort-s for the service
+    """
+    return {
+        'kind': 'Service',
+        'apiVersion': 'v1',
+        'metadata': {
+            'name': name
+        },
+        'spec': {
+            'type': 'NodePort',
+            'ports': ports,
+            'selector': selector
         }
     }

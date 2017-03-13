@@ -1,7 +1,7 @@
 """
 Test functions used to create k8s objects
 """
-from kubespawner.objects import make_pod_spec, make_pvc_spec
+from kubespawner.objects import make_pod_spec, make_pvc_spec, make_nodeport_spec
 
 
 def test_make_simplest_pod():
@@ -334,6 +334,36 @@ def test_make_resources_all():
                 'requests': {
                     'storage': '10Gi'
                 }
+            }
+        }
+    }
+
+
+def test_make_nodeport_service_simple():
+    """
+    Test simple NodePort service specification
+    """
+    assert make_nodeport_spec(
+        name='test',
+        selector={'foo': 'bar'},
+        ports=[
+            {'port': 80, 'protocol': 'TCP'},
+            {'port': 443, 'protocol': 'TCP'}
+        ]
+    ) == {
+        'kind': 'Service',
+        'apiVersion': 'v1',
+        'metadata': {
+            'name': 'test'
+        },
+        'spec': {
+            'type': 'NodePort',
+            'ports': [
+                {'port': 80, 'protocol': 'TCP'},
+                {'port': 443, 'protocol': 'TCP'}
+            ],
+            'selector': {
+                'foo': 'bar'
             }
         }
     }

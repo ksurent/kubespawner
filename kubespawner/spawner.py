@@ -16,7 +16,15 @@ from traitlets import Unicode, List, Integer, Union
 from jupyterhub.spawner import Spawner
 
 from kubespawner.utils import request_maker, k8s_url, Callable
-from kubespawner.objects import make_pod_spec, make_pvc_spec
+from kubespawner.objects import make_pod_spec, make_pvc_spec, make_nodeport_spec
+
+
+def _replace_unsafe(
+    unsafe,
+    ch='-',
+    safe=set(string.ascii_lowercase + string.digits)
+):
+    return ''.join([s if s in safe else ch for s in unsafe])
 
 
 class KubeSpawner(Spawner):
@@ -34,6 +42,8 @@ class KubeSpawner(Spawner):
         self.request = request_maker()
         self.pod_name = self._expand_user_properties(self.pod_name_template)
         self.pvc_name = self._expand_user_properties(self.pvc_name_template)
+        if self.nodeports:
+            self.svc_name = self._expand_user_properties(self.nodeport_name_template)
         if self.hub_connect_ip:
             scheme, netloc, path, params, query, fragment = urlparse(self.hub.api_url)
             netloc = '{ip}:{port}'.format(
@@ -376,13 +386,49 @@ class KubeSpawner(Spawner):
         """
     )
 
+    nodeports = List(
+        [],
+        config=True,
+        help="""
+        If not empty, a NodePort service will be created with given ports.
+
+        Worker pods can be made accessible from outside the Kubernetes cluster
+        by creating something called a NodePort service.
+
+        This value will be passed directly to the service definition so it must comply
+        with the format required at
+        https://kubernetes.io/docs/api-reference/v1/definitions/#_v1_serviceport
+
+        Note that if `nodePort` is not specified here, Kubernetes will dynamically allocate one
+        and it'll be the user's responsibility to make this information discoverable.
+        In either case port mappings will be exposed via the JPY_NODEPORTS environment
+        variable.
+
+        See https://kubernetes.io/docs/user-guide/services/#type-nodeport for more
+        information on how Services and NodePorts work.
+        """
+    )
+
+    nodeport_name_template = Unicode(
+        'nodeport-{username}-{userid}',
+        config=True,
+        help="""
+        Template to use to form the name of user's NodePort service.
+
+        {username} and {userid} are expanded to the escaped, dns-label safe
+        username & integer user id respectively.
+
+        This must be unique within the namespace the services are being spawned
+        in, so if you are running multiple jupyterhubs in the same namespace,
+        consider setting this to be something more unique.
+        """
+    )
+
     def _expand_user_properties(self, template):
         # Make sure username matches the restrictions for DNS labels
-        safe_chars = set(string.ascii_lowercase + string.digits)
-        safe_username = ''.join([s if s in safe_chars else '-' for s in self.user.name.lower()])
         return template.format(
             userid=self.user.id,
-            username=safe_username
+            username=_replace_unsafe(self.user.name.lower())
         )
 
     def _expand_all(self, src):
@@ -423,6 +469,8 @@ class KubeSpawner(Spawner):
         else:
             singleuser_fs_gid = self.singleuser_fs_gid
 
+        env = yield gen.maybe_future(self.get_env())
+
         return make_pod_spec(
             self.pod_name,
             self.singleuser_image_spec,
@@ -430,13 +478,14 @@ class KubeSpawner(Spawner):
             self.singleuser_image_pull_secrets,
             singleuser_uid,
             singleuser_fs_gid,
-            self.get_env(),
+            env,
             self._expand_all(self.volumes) + hack_volumes,
             self._expand_all(self.volume_mounts) + hack_volume_mounts,
             self.cpu_limit,
             self.cpu_guarantee,
             self.mem_limit,
             self.mem_guarantee,
+            self.get_pod_labels()
         )
 
     def get_pvc_manifest(self):
@@ -450,6 +499,12 @@ class KubeSpawner(Spawner):
             self.user_storage_capacity
         )
 
+    def get_nodeport_service_manifest(self):
+        return make_nodeport_spec(
+            self.svc_name,
+            self.get_pod_labels(),
+            self.nodeports
+        )
 
     @gen.coroutine
     def get_pod_info(self, pod_name):
@@ -486,6 +541,30 @@ class KubeSpawner(Spawner):
                     self.namespace,
                     'persistentvolumeclaims',
                     pvc_name,
+                )
+            ))
+        except HTTPError as e:
+            if e.code == 404:
+                return None
+            raise
+        data = response.body.decode('utf-8')
+        return json.loads(data)
+
+    @gen.coroutine
+    def get_nodeport_info(self, svc_name):
+        """
+        Fetch a service definition in the current namespace
+        The interesting bits are in `spec.ports[*].nodePort` which is where
+        dynamically allocated node ports can be found
+
+        Return `None` if the service doesn't exist
+        """
+        try:
+            response = yield self.httpclient.fetch(self.request(
+                k8s_url(
+                    self.namespace,
+                    'services',
+                    svc_name,
                 )
             ))
         except HTTPError as e:
@@ -558,6 +637,20 @@ class KubeSpawner(Spawner):
             except:
                 self.log.info("Pvc " + self.pvc_name + " already exists, so did not create new pvc.")
 
+        if self.nodeports:
+            nodeport_manifest = self.get_nodeport_service_manifest()
+            try:
+                yield self.httpclient.fetch(self.request(
+                    url=k8s_url(self.namespace, 'services'),
+                    body=json.dumps(nodeport_manifest),
+                    method='POST',
+                    headers={'Content-Type': 'application/json'}
+                ))
+            except HTTPError as e:
+                if e.code != 409:
+                    raise
+                self.log.info("Nodeport service %s already exists, so did not create a new one.", self.svc_name)
+
         # If we run into a 409 Conflict error, it means a pod with the
         # same name already exists. We stop it, wait for it to stop, and
         # try again. We try 4 times, and if it still fails we give up.
@@ -598,30 +691,45 @@ class KubeSpawner(Spawner):
             'apiVersion': 'v1',
             'gracePeriodSeconds': 0
         }
+        req_args = {
+            'method': 'DELETE',
+            'body': json.dumps(body),
+            'headers': {'Content-Type': 'application/json'},
+            # Tornado's client thinks DELETE requests shouldn't have a body
+            # which is a bogus restriction
+            'allow_nonstandard_methods': True
+        }
         yield self.httpclient.fetch(
             self.request(
                 url=k8s_url(self.namespace, 'pods', self.pod_name),
-                method='DELETE',
-                body=json.dumps(body),
-                headers={'Content-Type': 'application/json'},
-                # Tornado's client thinks DELETE requests shouldn't have a body
-                # which is a bogus restriction
-                allow_nonstandard_methods=True,
+                **req_args
             )
         )
+        yield self.httpclient.fetch(self.request(
+            url=k8s_url(self.namespace, 'services', self.svc_name),
+            **req_args
+        ))
         if not now:
             # If now is true, just return immediately, do not wait for
             # shut down to complete
             while True:
-                data = yield self.get_pod_info(self.pod_name)
-                if data is None:
+                pod = yield self.get_pod_info(self.pod_name)
+                svc = yield self.get_nodeport_info(self.svc_name)
+                if pod is None and svc is None:
                     break
                 yield gen.sleep(1)
 
     def _env_keep_default(self):
         return []
 
+    @gen.coroutine
     def get_env(self):
+        if self.nodeports:
+            try:
+                svc = yield self.get_nodeport_info(self.svc_name)
+            except:
+                raise
+
         env = super(KubeSpawner, self).get_env()
         env.update({
             'JPY_USER': self.user.name,
@@ -630,4 +738,20 @@ class KubeSpawner(Spawner):
             'JPY_HUB_PREFIX': self.hub.server.base_url,
             'JPY_HUB_API_URL': self.accessible_hub_api_url
         })
+        if svc:
+            for p in svc['spec']['ports']:
+                mapping = '{tport}:{nport}:{proto}'.format(
+                    tport=p['targetPort'],
+                    nport=p['nodePort'],
+                    proto=p['protocol']
+                )
+                mapping_name = _replace_unsafe(
+                    unsafe=p['name'].upper(),
+                    ch='_',
+                    safe=set(string.ascii_letters + string.digits)
+                )
+                env['JPY_NODEPORT_' + mapping_name] = mapping
         return env
+
+    def get_pod_labels(self):
+        return {'jpy-worker': self.pod_name}
